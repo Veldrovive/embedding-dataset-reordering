@@ -1,6 +1,7 @@
 """Main functionality"""
 
 import os
+import shutil
 from embedding_reader import EmbeddingReader
 import numpy as np
 import pandas as pd
