@@ -8,6 +8,8 @@ import pandas as pd
 import math
 import fsspec
 from tqdm import tqdm
+import time
+import plotext as plt
 
 import findspark
 
@@ -152,6 +154,8 @@ def reorder_embeddings(
 
     print("Created spark instance.\nLoading embeddings.")
 
+    start_time = time.perf_counter()
+
     embedding_reader = EmbeddingReader(  # TODO: Figure out if some kind of authorization will be necessary
         embeddings_folder=embeddings_folder,
         metadata_folder=metadata_folder,
@@ -163,6 +167,8 @@ def reorder_embeddings(
     end_index = embedding_reader.count if end is None else min(end, embedding_reader.count)
 
     print(f"Embedding reader found {embedding_reader.count} embeddings")
+
+    start_embedding_load_time = time.perf_counter()
 
     print("========= Formatting Intermediate Embeddings =========")
     if parallelize_reading:
@@ -190,12 +196,14 @@ def reorder_embeddings(
         )
 
     print("========= Recalling and Reordering Embeddings =========")
+    start_recall_time = time.perf_counter()
     # Recall the data that was saved by each worker into a single dataframe so that we can do a full sort
     remote_path = os.path.join(output_base_path, intermediate_folder, "*.parquet")
     print("Recalling data from worker paths:", remote_path)
     data = spark.read.parquet(remote_path)  # TODO: Verify this work with remote files
     example_embedding = np.array(data.first().embeddings)
 
+    start_missing_fill_time = time.perf_counter()
     if fill_missing:
         print("========= Inserting Missing Data =========")
         # If an image returned a error during webdataset creation, it will still take up an index, but will not be included in the embeddings
@@ -215,6 +223,8 @@ def reorder_embeddings(
         print(f"Found {missing_values.count()} missing ranges.")
         
         added_data = []
+        current_amount = 0
+        added_files = 0
         for row in tqdm(missing_values.collect()):
             shard = row.img_shard
             first_missing_index, next_full_index = row.first_missing_index, row.next_full_index
@@ -225,8 +235,24 @@ def reorder_embeddings(
                     continue
             for missing_index in range(first_missing_index, next_full_index):
                 added_data.append((shard, missing_index, np.zeros_like(example_embedding).tolist()))
-        added_df = spark.createDataFrame(added_data, ["img_shard", "img_index", "embeddings"])
+                current_amount += 1
+                if current_amount > 1000:
+                    df = pd.DataFrame(data=added_data, columns=["img_shard", "img_index", "embeddings"])
+                    with working_fs.open(os.path.join(intermediate_folder_path, f'empty_{added_files}.parquet'), "wb") as f:
+                        df.to_parquet(f)
+                    added_data.clear()
+                    current_amount = 0
+                    added_files += 1
+        df = pd.DataFrame(data=added_data, columns=["img_shard", "img_index", "embeddings"])
+        with working_fs.open(os.path.join(intermediate_folder_path, f'empty_{added_files}.parquet'), "wb") as f:
+            df.to_parquet(f)
+        empty_path = os.path.join(output_base_path, intermediate_folder, "empty_*.parquet")
+        added_df = spark.read.parquet(empty_path)
         data = data.union(added_df)
+
+    full_count = data.count()
+
+    start_export_time = time.perf_counter()
 
     print("========= Grouping and Saving =========")
     grouped = (
@@ -234,12 +260,33 @@ def reorder_embeddings(
         .groupBy("img_shard")
         .agg(F.collect_list("embeddings").alias("embeddings"))
     )
-    # TODO: Each group will be very large. In the hundereds of megabytes. Spark wants partitions to be under 1000KiB. Not sure what happens if you exceed that by a factor of 300.
-    # I now know what happens. It immediatly crashes.
+    # # TODO: Each group will be very large. In the hundereds of megabytes. Spark wants partitions to be under 1000KiB. Not sure what happens if you exceed that by a factor of 300.
+    # # I now know what happens. It immediatly crashes.
 
-    # Parallelize saving the grouped embeddings as this also takes a while
+    # # Parallelize saving the grouped embeddings as this also takes a while
 
     grouped.foreach(lambda row: save_row(row, output_folder_path))
+    end_time = time.perf_counter()
     shards = [row.img_shard for row in grouped.select("img_shard").collect()]
     working_fs.rm(intermediate_folder_path, recursive=True)
+
+    embed_reader_initialization_time = start_embedding_load_time - start_time
+    embedding_load_time = start_recall_time - start_embedding_load_time
+    recall_time = start_missing_fill_time - start_recall_time
+    missing_fill_time = start_export_time - start_missing_fill_time
+    export_time = end_time - start_export_time
+    total_time = end_time - start_time
+
+    print(f"Total Execution Time: {total_time:0.2f}s")
+
+    tasks = list(reversed(["Initialize Embedding Reader", "Load Embeddings", "Recall Embeddings", "Insert Missing Embeddings", "Save Embeddings"]))
+    times = list(reversed([embed_reader_initialization_time, embedding_load_time, recall_time, missing_fill_time, export_time]))
+    plt.bar(tasks, times, orientation="horizontal", width = 0.3)
+    plt.clc()
+    plt.xlabel("Execution Time (s)")
+    plt.show()
+
+    
+
+
     return [os.path.join(output_folder, f"img_emb_{shard_index}.npy") for shard_index in shards]
