@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import math
 import fsspec
+from tqdm import tqdm
 
 import findspark
 
@@ -119,6 +120,7 @@ def reorder_embeddings(
     overwrite=False,
     parallelize_reading=False,
     fill_missing=True,
+    skip_fill_range_over=None
 ):
     """
     Reorders embeddings such that they are in the same order as the webdataset that was used to generate them.
@@ -143,6 +145,7 @@ def reorder_embeddings(
         SparkSession.builder.master("local")
         .appName("Embedding Reorder")
         .config("spark.ui.showConsoleProgress", "true")
+        .config("spark.executor.memory", "2g")
         .getOrCreate()
     )  # TODO: Add in the ability to have nodes
     sc = spark.sparkContext
@@ -174,7 +177,7 @@ def reorder_embeddings(
             )
         )
     else:
-        batch_size = min(math.ceil((end_index - start_index) / intermediate_partitions), 10e3)
+        batch_size = int(min(math.ceil((end_index - start_index) / intermediate_partitions), 10e4))
         download_embeddings(
             embedding_reader,
             intermediate_folder_path,
@@ -209,12 +212,17 @@ def reorder_embeddings(
       WHERE img_index - last_img_index > 1 OR (last_img_index IS NULL AND img_index > 0)
     """
         )  # The where clause catches both the case where any index besides the first is skipped and the case where the first index is skipped
+        print(f"Found {missing_values.count()} missing ranges.")
+        
         added_data = []
-        for row in missing_values.collect():
+        for row in tqdm(missing_values.collect()):
             shard = row.img_shard
             first_missing_index, next_full_index = row.first_missing_index, row.next_full_index
             if first_missing_index is None:
                 first_missing_index = 0
+            if skip_fill_range_over is not None:
+                if next_full_index - first_missing_index > skip_fill_range_over:
+                    continue
             for missing_index in range(first_missing_index, next_full_index):
                 added_data.append((shard, missing_index, np.zeros_like(example_embedding).tolist()))
         added_df = spark.createDataFrame(added_data, ["img_shard", "img_index", "embeddings"])
@@ -222,11 +230,15 @@ def reorder_embeddings(
 
     print("========= Grouping and Saving =========")
     grouped = (
-        data.orderBy("img_shard", "img_index")
+        data.orderBy("img_index")
         .groupBy("img_shard")
         .agg(F.collect_list("embeddings").alias("embeddings"))
     )
+    # TODO: Each group will be very large. In the hundereds of megabytes. Spark wants partitions to be under 1000KiB. Not sure what happens if you exceed that by a factor of 300.
+    # I now know what happens. It immediatly crashes.
+
     # Parallelize saving the grouped embeddings as this also takes a while
+
     grouped.foreach(lambda row: save_row(row, output_folder_path))
     shards = [row.img_shard for row in grouped.select("img_shard").collect()]
     working_fs.rm(intermediate_folder_path, recursive=True)
