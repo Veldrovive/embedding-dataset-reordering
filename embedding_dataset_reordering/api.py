@@ -101,10 +101,11 @@ def save_row(row, fs_path: str):
     """
     fs, fs_base_path = fsspec.core.url_to_fs(fs_path)
     shard_index = row.img_shard
+    partition_group = row.partition_group
     embeddings = row.embeddings
     np_embeddings = np.array(embeddings)
     fs.makedirs(fs_base_path, exist_ok=True)
-    save_path = os.path.join(fs_base_path, f"img_emb_{shard_index}.npy")
+    save_path = os.path.join(fs_base_path, f"img_emb_{shard_index}-{partition_group}.npy")
     with fs.open(save_path, "wb") as f:
         np.save(f, np_embeddings)
 
@@ -255,11 +256,17 @@ def reorder_embeddings(
     start_export_time = time.perf_counter()
 
     print("========= Grouping and Saving =========")
+    data.createOrReplaceTempView("df")
+    group_partitioned = spark.sql("""
+        SELECT *, FLOOR(img_index / 1000) as partition_group FROM df
+    """)
+    print("Data count", group_partitioned.count())
     grouped = (
-        data.orderBy("img_index")
-        .groupBy("img_shard")
+        group_partitioned.orderBy("img_index")
+        .groupBy("img_shard", "partition_group")
         .agg(F.collect_list("embeddings").alias("embeddings"))
     )
+    print("Grouped count", grouped.count())
     # # TODO: Each group will be very large. In the hundereds of megabytes. Spark wants partitions to be under 1000KiB. Not sure what happens if you exceed that by a factor of 300.
     # # I now know what happens. It immediatly crashes.
 
@@ -285,8 +292,3 @@ def reorder_embeddings(
     plt.clc()
     plt.xlabel("Execution Time (s)")
     plt.show()
-
-    
-
-
-    return [os.path.join(output_folder, f"img_emb_{shard_index}.npy") for shard_index in shards]
