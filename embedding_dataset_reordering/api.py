@@ -6,6 +6,7 @@ from embedding_reader import EmbeddingReader
 import numpy as np
 import pandas as pd
 import math
+import fsspec
 
 import findspark
 
@@ -13,6 +14,7 @@ findspark.init()
 
 from pyspark.sql import SparkSession  # pylint: disable=wrong-import-position
 import pyspark.sql.functions as F  # pylint: disable=wrong-import-position
+from pyspark.sql.window import Window  # pylint: disable=wrong-import-position
 
 
 def download_embedding_range(
@@ -45,13 +47,15 @@ def download_embedding_range(
 
 
 def download_embeddings(
-    embedding_reader, output_folder, shards=None, start=0, end=None, shard_width=5, batch_size=10e3
+    embedding_reader: EmbeddingReader, output_folder: str, fs: fsspec.AbstractFileSystem, shards: int=None, start: int=0, end:int=None, shard_width:int=5, batch_size:int=10e3
 ):
     """
     Uses an existing embedding reader to download the embeddings and metadata.
     Optionally split the output into smaller shards each containing a fraction of the data
+
+    Files will be saved to the fs filesystem.
     """
-    os.makedirs(output_folder, exist_ok=True)
+    fs.makedirs(output_folder, exist_ok=True)
     if end is None:
         end = embedding_reader.count
     embedding_generator = embedding_reader(batch_size=batch_size, start=start, end=end)
@@ -64,7 +68,8 @@ def download_embeddings(
         # Used to save a single shard of the data so that they can potentially be distributed
         nonlocal frames, shard_number, current_shard_size
         df = pd.concat(frames)
-        df.to_parquet(os.path.join(output_folder, f"meta_embeddings_{shard_number}.parquet"), index=False)
+        with fs.open(os.path.join(output_folder, f"meta_embeddings_{shard_number}.parquet"), "wb") as f:
+            df.to_parquet(f, index=False)
         frames.clear()
         shard_number += 1
         current_shard_size = 0
@@ -83,26 +88,30 @@ def download_embeddings(
         save_frames()
 
 
-def save_row(row, output_folder):
+def save_row(row, fs_path: str):
     """
     Saves a single row of the ordered and grouped dataset.
     At this stage, the embeddings are already combined in the correct order.
     We just need to convert them to a numpy array and save them under the correct shard id.
+
+    Files will be saved to the fs_path filesystem.
     """
+    fs, fs_base_path = fsspec.core.url_to_fs(fs_path)
     shard_index = row.img_shard
     embeddings = row.embeddings
     np_embeddings = np.array(embeddings)
-    os.makedirs(output_folder, exist_ok=True)
-    save_path = os.path.join(output_folder, f"img_emb_{shard_index}.npy")
-    with open(save_path, "wb") as f:
+    fs.makedirs(fs_base_path, exist_ok=True)
+    save_path = os.path.join(fs_base_path, f"img_emb_{shard_index}.npy")
+    with fs.open(save_path, "wb") as f:
         np.save(f, np_embeddings)
 
 
 def reorder_embeddings(
+    output_base_path,
     embeddings_folder,
     metadata_folder,
-    output_folder,
-    intermediate_folder="./tmp",
+    output_folder="reordered_embeddings",
+    intermediate_folder="tmp",
     intermediate_partitions=5,
     start=0,
     end=None,
@@ -116,13 +125,17 @@ def reorder_embeddings(
     If using the index of the image in the webdataset, it is not necessary to fill missing values.
     If using the filepath itself, failing to fill missing values will result in a mismatch between images and embeddings
     """
-    if not overwrite and os.path.exists(output_folder) and len(os.listdir(output_folder)) > 0:
+    working_fs, working_fs_path = fsspec.core.url_to_fs(output_base_path)
+    output_folder_path = os.path.join(output_base_path, output_folder)  # Used in original format since save_row makes it's own fs
+    intermediate_folder_path = os.path.join(working_fs_path, intermediate_folder)  # Used in non-parallelized functions so we can make this into an fs here
+
+    if not overwrite and working_fs.exists(output_folder_path) and len(working_fs.listdir(output_folder_path)) > 0:
         raise RuntimeError("Output folder already has embeddings in it")
 
     print("========= Starting Reorder =========")
     print(f"  Embedding Source: {embeddings_folder}")
     print(f"  Metadata Source: {metadata_folder}")
-    print(f"  Output Folder: {output_folder}")
+    print(f"  Output Folder: {output_folder_path}")
     print(f"  Intermediate Partitions: {intermediate_partitions}")
     print(f"  Overwriting Old Embeddings: {overwrite}")
 
@@ -164,7 +177,8 @@ def reorder_embeddings(
         batch_size = min(math.ceil((end_index - start_index) / intermediate_partitions), 10e3)
         download_embeddings(
             embedding_reader,
-            intermediate_folder,
+            intermediate_folder_path,
+            fs=working_fs,
             shards=intermediate_partitions,
             start=start_index,
             end=end_index,
@@ -174,7 +188,9 @@ def reorder_embeddings(
 
     print("========= Recalling and Reordering Embeddings =========")
     # Recall the data that was saved by each worker into a single dataframe so that we can do a full sort
-    data = spark.read.parquet(intermediate_folder)
+    remote_path = os.path.join(output_base_path, intermediate_folder, "*.parquet")
+    print("Recalling data from worker paths:", remote_path)
+    data = spark.read.parquet(remote_path)  # TODO: Verify this work with remote files
     example_embedding = np.array(data.first().embeddings)
 
     if fill_missing:
@@ -188,18 +204,20 @@ def reorder_embeddings(
       SELECT img_shard, last_img_index + 1 AS first_missing_index, img_index AS next_full_index FROM (
         SELECT
           img_shard, img_index,
-          LAG(img_index, 1) OVER (ORDER BY img_shard, img_index) AS last_img_index
+          LAG(img_index, 1) OVER (PARTITION BY img_shard ORDER BY img_index) AS last_img_index
         FROM df ) list
-      WHERE img_index - last_img_index > 1
+      WHERE img_index - last_img_index > 1 OR (last_img_index IS NULL AND img_index > 0)
     """
-        )
+        )  # The where clause catches both the case where any index besides the first is skipped and the case where the first index is skipped
         added_data = []
         for row in missing_values.collect():
             shard = row.img_shard
             first_missing_index, next_full_index = row.first_missing_index, row.next_full_index
+            if first_missing_index is None:
+                first_missing_index = 0
             for missing_index in range(first_missing_index, next_full_index):
                 added_data.append((shard, missing_index, np.zeros_like(example_embedding).tolist()))
-        added_df = spark.createDataFrame(added_data, ["img_shard", "img_index", "embeddedings"])
+        added_df = spark.createDataFrame(added_data, ["img_shard", "img_index", "embeddings"])
         data = data.union(added_df)
 
     print("========= Grouping and Saving =========")
@@ -209,7 +227,7 @@ def reorder_embeddings(
         .agg(F.collect_list("embeddings").alias("embeddings"))
     )
     # Parallelize saving the grouped embeddings as this also takes a while
-    grouped.foreach(lambda row: save_row(row, output_folder))
+    grouped.foreach(lambda row: save_row(row, output_folder_path))
     shards = [row.img_shard for row in grouped.select("img_shard").collect()]
-    shutil.rmtree(intermediate_folder)
+    working_fs.rm(intermediate_folder_path, recursive=True)
     return [os.path.join(output_folder, f"img_emb_{shard_index}.npy") for shard_index in shards]
