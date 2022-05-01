@@ -4,6 +4,9 @@ import pandas as pd
 import numpy as np
 from img2dataset import download
 from clip_retrieval import clip_inference
+import time
+import plotext as plt
+from collections import OrderedDict
 
 
 def get_example_key(metadata_folder="./"):
@@ -97,3 +100,51 @@ def verify_reorder(embeddings_folder, metadata_folder, reordered_embeddings_fold
             if not correct:
                 errors.append([shard, original_index, img_shard, img_index])
     return errors
+
+class RuntimeAnalyzer:
+    def __init__(self):
+        self.runtimes = OrderedDict()  # Dictionary of lists of runtimes
+        self.running = False
+        self.run_start = None
+        self.full_run_time = None
+
+    def start(self):
+        self.runtimes.clear()
+        self.running = True
+        self.run_start = time.perf_counter()
+        
+    def end(self):
+        self.running = False
+        self.full_run_time = time.perf_counter() - self.run_start
+
+    def add_runtime(self, key, start, end):
+        if not self.running:
+            raise RuntimeError("Tried to add {key} while analyzer is not running")
+        if key not in self.runtimes:
+            self.runtimes[key] = []
+        self.runtimes[key].append(end - start)
+
+    def start_timer(self, key):
+        if not self.running:
+            raise RuntimeError("Tried to time {key} while analyzer is not running")
+        start_time = time.perf_counter()
+        return lambda: self.add_runtime(key, start_time, time.perf_counter())
+
+    def get_runtimes(self):
+      total_runtimes = OrderedDict()
+      for key, runtimes in self.runtimes.items():
+        total_runtimes[key] = sum(runtimes)
+      return total_runtimes
+
+    def get_runtime_fractions(self):
+      return { key: runtime / self.full_run_time for key, runtime in self.get_runtimes().items() }
+
+    def graph(self):
+      total_runtimes = self.get_runtimes()
+      tasks = list(total_runtimes.keys())
+      times = list(total_runtimes.values())
+      plt.bar(tasks, times, orientation="horizontal", width = 0.3)
+      plt.clc()
+      plt.xlabel("Execution Time (s)")
+      plt.xlim(0, max(times))
+      plt.show()

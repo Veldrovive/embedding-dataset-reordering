@@ -10,6 +10,7 @@ import fsspec
 from tqdm import tqdm
 import time
 import plotext as plt
+from embedding_dataset_reordering.helper import RuntimeAnalyzer
 
 import findspark
 
@@ -19,77 +20,57 @@ from pyspark.sql import SparkSession  # pylint: disable=wrong-import-position
 import pyspark.sql.functions as F  # pylint: disable=wrong-import-position
 from pyspark.sql.window import Window  # pylint: disable=wrong-import-position
 
+import os
+os.environ['PYSPARK_SUBMIT_ARGS'] = "--packages=com.amazonaws:aws-java-sdk-bundle:1.11.271,org.apache.hadoop:hadoop-aws:3.1.2 pyspark-shell"
 
-def download_embedding_range(
-    r, embeddings_folder, metadata_folder, folder="numpy_parquet", shard_width=5, batch_size=10e3
-):
+ra = RuntimeAnalyzer()
+
+def download_embeddings_parallel(spark, embeddings_folder, metadata_folder, output_folder, cores, shard_width, stop_after=None):
     """
-    Uses embedding-reader to create parquet files that have the image dataset
-    shard id and index as well as the corresponding embedding.
-    Since this is done in parallel with other downloaders, each needs to have it's own embedding reader object.
+    Uses pyspark to parallelize downloading and formatting metadata parquet files to also include embeddings.
     """
-    os.makedirs(folder, exist_ok=True)
-    partition_number, start, end = r
-    embedding_generator = EmbeddingReader(
-        embeddings_folder=embeddings_folder,
-        metadata_folder=metadata_folder,
-        meta_columns=["image_path"],
-        file_format="parquet_npy",
-    )(batch_size=batch_size, start=start, end=end)
-    frames = []
-    for data, meta in embedding_generator:
-        # In order to split the image_path into the shard and index, we use a constant called shard width that defines how many digits make up the shard name
-        meta["img_shard"] = meta.image_path.str[:shard_width].astype(int)
-        meta["img_index"] = meta.image_path.str[shard_width:].astype(int)
-        meta.drop("image_path", axis=1, inplace=True)
-        meta.drop("i", axis=1, inplace=True)
-        meta["embeddings"] = data.tolist()
-        frames.append(meta)
-    df = pd.concat(frames)
-    df.to_parquet(os.path.join(folder, f"meta_embeddings_{partition_number}.parquet"), index=False)
+    embeddings_fs, embeddings_path = fsspec.core.url_to_fs(embeddings_folder)
+    metadata_fs, metadata_path = fsspec.core.url_to_fs(metadata_folder)
+    output_fs, output_path = fsspec.core.url_to_fs(output_folder)
+    embedding_files = embeddings_fs.ls(embeddings_path)
+    metadata_files = metadata_fs.ls(metadata_path)
+    get_shard = lambda filename: filename.split("_")[-1].split(".")[0]
+    embedding_files.sort(key=lambda filename: int(get_shard(filename)))
+    metadata_files.sort(key=lambda filename: int(get_shard(filename)))
 
+    files = []
+    output_fs.makedirs(output_path, exist_ok=True)
+    for emb_file, meta_file in zip(embedding_files, metadata_files):
+        assert get_shard(emb_file) == get_shard(meta_file)
+        out_file = os.path.join(output_path, f"emb_meta_{get_shard(emb_file)}.parquet")
+        files.append((
+            (emb_file, embeddings_fs.to_json()),
+            (meta_file, metadata_fs.to_json()),
+            (out_file, output_fs.to_json())
+        ))
+    if stop_after is not None:
+        files = files[:stop_after]
+    files_rdd = spark.sparkContext.parallelize(files)
 
-def download_embeddings(
-    embedding_reader: EmbeddingReader, output_folder: str, fs: fsspec.AbstractFileSystem, shards: int=None, start: int=0, end:int=None, shard_width:int=5, batch_size:int=10e3
-):
-    """
-    Uses an existing embedding reader to download the embeddings and metadata.
-    Optionally split the output into smaller shards each containing a fraction of the data
+    def combine(row):
+        """
+        Downloads and formats a single parquet metadata file
+        """
+        emb_file_data, meta_file_data, out_file_data = row
+        emb_fs = fsspec.AbstractFileSystem.from_json(emb_file_data[1])
+        meta_fs = fsspec.AbstractFileSystem.from_json(meta_file_data[1])
+        out_fs = fsspec.AbstractFileSystem.from_json(out_file_data[1])
+        with emb_fs.open(emb_file_data[0], "rb") as emb_f, meta_fs.open(meta_file_data[0], "rb") as meta_f, out_fs.open(out_file_data[0], "wb") as out_f:
+            emb = np.load(emb_f)
+            meta = pd.read_parquet(meta_f, columns=["image_path"])
+            meta["img_shard"] = meta.image_path.str[:shard_width].astype(int)
+            meta["img_index"] = meta.image_path.str[shard_width:].astype(int)
+            meta.drop("image_path", axis=1, inplace=True)
+            meta["embeddings"] = emb.tolist()
+            meta.to_parquet(out_f, index=False)
 
-    Files will be saved to the fs filesystem.
-    """
-    fs.makedirs(output_folder, exist_ok=True)
-    if end is None:
-        end = embedding_reader.count
-    embedding_generator = embedding_reader(batch_size=batch_size, start=start, end=end)
-    frames = []
-    shard_number = 0
-    current_shard_size = 0
-    shard_size_limit = math.ceil(end - start if shards is None else (end - start) / shards)
-
-    def save_frames():
-        # Used to save a single shard of the data so that they can potentially be distributed
-        nonlocal frames, shard_number, current_shard_size
-        df = pd.concat(frames)
-        with fs.open(os.path.join(output_folder, f"meta_embeddings_{shard_number}.parquet"), "wb") as f:
-            df.to_parquet(f, index=False)
-        frames.clear()
-        shard_number += 1
-        current_shard_size = 0
-
-    for data, meta in embedding_generator:
-        meta["img_shard"] = meta.image_path.str[:shard_width].astype(int)
-        meta["img_index"] = meta.image_path.str[shard_width:].astype(int)
-        meta.drop("image_path", axis=1, inplace=True)
-        meta.drop("i", axis=1, inplace=True)
-        meta["embeddings"] = data.tolist()
-        frames.append(meta)
-        current_shard_size += data.shape[0]
-        if current_shard_size >= shard_size_limit:
-            save_frames()  # This won't ensure shards are always under shard_size_limit, but will make sure they are less than one batch size larger
-    if len(frames) > 0:
-        save_frames()
-
+    files_rdd.foreach(combine)
+        
 
 def save_row(row, fs_path: str):
     """
@@ -106,6 +87,7 @@ def save_row(row, fs_path: str):
     np_embeddings = np.array(embeddings)
     fs.makedirs(fs_base_path, exist_ok=True)
     save_path = os.path.join(fs_base_path, f"img_emb_{shard_index}-{partition_group}.npy")
+    # print(f"Saving: {save_path}")
     with fs.open(save_path, "wb") as f:
         np.save(f, np_embeddings)
 
@@ -116,14 +98,15 @@ def reorder_embeddings(
     metadata_folder,
     output_folder="reordered_embeddings",
     intermediate_folder="tmp",
-    intermediate_partitions=5,
-    start=0,
-    end=None,
+    num_shards=None,
     shard_width=5,
+    cores=1,
+    memory=16,
     overwrite=False,
-    parallelize_reading=False,
-    fill_missing=True,
-    skip_fill_range_over=None
+    skip_fill_range_over=None,
+    skip_format_embed=False,
+    skip_fill=False,
+    skip_sort=False
 ):
     """
     Reorders embeddings such that they are in the same order as the webdataset that was used to generate them.
@@ -131,81 +114,92 @@ def reorder_embeddings(
     If using the filepath itself, failing to fill missing values will result in a mismatch between images and embeddings
     """
     working_fs, working_fs_path = fsspec.core.url_to_fs(output_base_path)
-    output_folder_path = os.path.join(output_base_path, output_folder)  # Used in original format since save_row makes it's own fs
-    intermediate_folder_path = os.path.join(working_fs_path, intermediate_folder)  # Used in non-parallelized functions so we can make this into an fs here
+    output_folder_path = os.path.join(working_fs_path, output_folder)
+    output_folder_remote_path = os.path.join(output_base_path, output_folder)  # Used in original format since save_row makes it's own fs
+    intermediate_folder_path = os.path.join(working_fs_path, intermediate_folder)
+    meta_embed_folder_path = os.path.join(intermediate_folder_path, "meta_embed")
+    empty_embed_folder_path = os.path.join(intermediate_folder_path, "empty")
 
-    if not overwrite and working_fs.exists(output_folder_path) and len(working_fs.listdir(output_folder_path)) > 0:
-        raise RuntimeError("Output folder already has embeddings in it")
+    def rm_folder(fs, folder_path):
+        try:
+            fs.rm(folder_path, recursive=True)
+        except FileNotFoundError:
+            pass
+    
+    # Some unexpected behavior can occur if we do not remove existing folders so we do that at the top
+    if working_fs.exists(output_folder_path) and not skip_sort:
+        # Then we should delete it if we are overwriting or error if we aren't
+        if overwrite:
+            rm_folder(working_fs, output_folder_path)
+        else:
+            raise RuntimeError("Output folder already has embeddings in it")
+    # Create output
+    if not skip_sort:
+        working_fs.makedirs(output_folder_path, exist_ok=True)
+
+
+    if working_fs.exists(meta_embed_folder_path) and not skip_format_embed:
+        # Then if we are not skipping embed, we need to check if we enabled overwrites
+        if overwrite:
+            rm_folder(working_fs, meta_embed_folder_path)
+            # otherwise if we are not overwriting and not skipping this should error
+        else:
+            raise RuntimeError("Itermediate embedding folder for metadata+embeddings already has data in it")
+    if not skip_format_embed:
+        working_fs.makedirs(meta_embed_folder_path, exist_ok=True)
+
+    # And we need the same for the empty path
+    if working_fs.exists(empty_embed_folder_path) and not skip_fill:
+        # Then if we are not skipping empty, we need to check if we enabled overwrites
+        if overwrite:
+            rm_folder(working_fs, empty_embed_folder_path)
+            # otherwise if we are not overwriting and not skipping this should error
+        else:
+            raise RuntimeError("Itermediate embedding folder for empty embeddings already has data in it")
+    if not skip_fill:
+        working_fs.makedirs(empty_embed_folder_path, exist_ok=True)
 
     print("========= Starting Reorder =========")
     print(f"  Embedding Source: {embeddings_folder}")
     print(f"  Metadata Source: {metadata_folder}")
     print(f"  Output Folder: {output_folder_path}")
-    print(f"  Intermediate Partitions: {intermediate_partitions}")
     print(f"  Overwriting Old Embeddings: {overwrite}")
 
     spark = (
-        SparkSession.builder.master("local")
+        SparkSession.builder.master(f"local[{cores}]")
         .appName("Embedding Reorder")
         .config("spark.ui.showConsoleProgress", "true")
-        .config("spark.executor.memory", "2g")
+        .config("spark.executor.memory", f"{memory}g")
+        .config("spark.driver.memory", f"{memory}g")
         .getOrCreate()
     )  # TODO: Add in the ability to have nodes
     sc = spark.sparkContext
 
+    hadoop_conf = sc._jsc.hadoopConfiguration()
+    hadoop_conf.set("fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.TemporaryAWSCredentialsProvider")
+
     print("Created spark instance.\nLoading embeddings.")
 
-    start_time = time.perf_counter()
+    ra.start()
 
-    embedding_reader = EmbeddingReader(  # TODO: Figure out if some kind of authorization will be necessary
-        embeddings_folder=embeddings_folder,
-        metadata_folder=metadata_folder,
-        meta_columns=["image_path"],
-        file_format="parquet_npy",
-    )
-
-    start_index = max(0, start)
-    end_index = embedding_reader.count if end is None else min(end, embedding_reader.count)
-
-    print(f"Embedding reader found {embedding_reader.count} embeddings")
-
-    start_embedding_load_time = time.perf_counter()
-
-    print("========= Formatting Intermediate Embeddings =========")
-    if parallelize_reading:
-        # Parallelize the downloading of the embeddings
-        partition_width = (end_index - start_index) / intermediate_partitions
-        ends = [int(round(partition_width * i)) + start_index for i in range(intermediate_partitions + 1)]
-        ranges = list(zip(range(len(ends) - 1), ends, ends[1:]))
-        ranges_rdd = sc.parallelize(ranges)
-        ranges_rdd.foreach(
-            lambda r: download_embedding_range(
-                r, embeddings_folder, metadata_folder, shard_width=shard_width, folder=intermediate_folder
-            )
-        )
-    else:
-        batch_size = int(min(math.ceil((end_index - start_index) / intermediate_partitions), 10e4))
-        download_embeddings(
-            embedding_reader,
-            intermediate_folder_path,
-            fs=working_fs,
-            shards=intermediate_partitions,
-            start=start_index,
-            end=end_index,
-            shard_width=shard_width,
-            batch_size=batch_size,
-        )
+    if not skip_format_embed:
+        print("========= Formatting Intermediate Embeddings =========")
+        end_read_embeddings_timer = ra.start_timer("Read embeddings")
+        download_embeddings_parallel(spark, embeddings_folder, metadata_folder, meta_embed_folder_path, cores=cores, shard_width=shard_width, stop_after=num_shards)
+        end_read_embeddings_timer()
 
     print("========= Recalling and Reordering Embeddings =========")
-    start_recall_time = time.perf_counter()
+    end_recall_timer = ra.start_timer("Recall Embeddings")
     # Recall the data that was saved by each worker into a single dataframe so that we can do a full sort
-    remote_path = os.path.join(output_base_path, intermediate_folder, "*.parquet")
+    remote_path = os.path.join(output_base_path, intermediate_folder, "meta_embed", "*.parquet")
     print("Recalling data from worker paths:", remote_path)
-    data = spark.read.parquet(remote_path)  # TODO: Verify this work with remote files
+    data = spark.read.parquet(remote_path)  # TODO: Verify this work with remote files. It doesn't. It needs to be able to connect to the s3 file system.
     example_embedding = np.array(data.first().embeddings)
 
-    start_missing_fill_time = time.perf_counter()
-    if fill_missing:
+    end_recall_timer()
+
+    end_fill_timer = ra.start_timer("Fill Missing Embeddings")
+    if not skip_fill:
         print("========= Inserting Missing Data =========")
         # If an image returned a error during webdataset creation, it will still take up an index, but will not be included in the embeddings
         # This means if we do not account for these missing indices, we will be off by one for all subsequent embeddings in the shard
@@ -237,58 +231,39 @@ def reorder_embeddings(
             for missing_index in range(first_missing_index, next_full_index):
                 added_data.append((shard, missing_index, np.zeros_like(example_embedding).tolist()))
                 current_amount += 1
-                if current_amount > 1000:
+                if current_amount > 10000:
                     df = pd.DataFrame(data=added_data, columns=["img_shard", "img_index", "embeddings"])
-                    with working_fs.open(os.path.join(intermediate_folder_path, f'empty_{added_files}.parquet'), "wb") as f:
+                    with working_fs.open(os.path.join(empty_embed_folder_path, f'empty_{added_files}.parquet'), "wb") as f:
                         df.to_parquet(f)
                     added_data.clear()
                     current_amount = 0
                     added_files += 1
         df = pd.DataFrame(data=added_data, columns=["img_shard", "img_index", "embeddings"])
-        with working_fs.open(os.path.join(intermediate_folder_path, f'empty_{added_files}.parquet'), "wb") as f:
+        with working_fs.open(os.path.join(empty_embed_folder_path, f'empty_{added_files}.parquet'), "wb") as f:
             df.to_parquet(f)
-        empty_path = os.path.join(output_base_path, intermediate_folder, "empty_*.parquet")
-        added_df = spark.read.parquet(empty_path)
+        empty_path = os.path.join(output_base_path, intermediate_folder, 'empty', "empty_*.parquet")
+        added_df = spark.read.parquet(empty_path)  # TODO: Make this work with remote
         data = data.union(added_df)
 
-    full_count = data.count()
+    end_fill_timer()
+    end_export_timer = ra.start_timer("Sort & Export")
+    if not skip_sort:
+        print("========= Grouping and Saving =========")
+        data.createOrReplaceTempView("df")
+        data = spark.sql("""
+            SELECT *, FLOOR(img_index / 1000) as partition_group FROM df
+        """)
+        grouped = (
+            data.orderBy("img_index")
+            .groupBy("img_shard", "partition_group")
+            .agg(F.collect_list("embeddings").alias("embeddings"))
+        )
 
-    start_export_time = time.perf_counter()
+        # # Parallelize saving the grouped embeddings as this also takes a while
+        grouped.foreach(lambda row: save_row(row, output_folder_remote_path))
+    end_export_timer()
+    ra.end()
 
-    print("========= Grouping and Saving =========")
-    data.createOrReplaceTempView("df")
-    group_partitioned = spark.sql("""
-        SELECT *, FLOOR(img_index / 1000) as partition_group FROM df
-    """)
-    print("Data count", group_partitioned.count())
-    grouped = (
-        group_partitioned.orderBy("img_index")
-        .groupBy("img_shard", "partition_group")
-        .agg(F.collect_list("embeddings").alias("embeddings"))
-    )
-    print("Grouped count", grouped.count())
-    # # TODO: Each group will be very large. In the hundereds of megabytes. Spark wants partitions to be under 1000KiB. Not sure what happens if you exceed that by a factor of 300.
-    # # I now know what happens. It immediatly crashes.
-
-    # # Parallelize saving the grouped embeddings as this also takes a while
-
-    grouped.foreach(lambda row: save_row(row, output_folder_path))
-    end_time = time.perf_counter()
-    shards = [row.img_shard for row in grouped.select("img_shard").collect()]
-    working_fs.rm(intermediate_folder_path, recursive=True)
-
-    embed_reader_initialization_time = start_embedding_load_time - start_time
-    embedding_load_time = start_recall_time - start_embedding_load_time
-    recall_time = start_missing_fill_time - start_recall_time
-    missing_fill_time = start_export_time - start_missing_fill_time
-    export_time = end_time - start_export_time
-    total_time = end_time - start_time
-
-    print(f"Total Execution Time: {total_time:0.2f}s")
-
-    tasks = list(reversed(["Initialize Embedding Reader", "Load Embeddings", "Recall Embeddings", "Insert Missing Embeddings", "Save Embeddings"]))
-    times = list(reversed([embed_reader_initialization_time, embedding_load_time, recall_time, missing_fill_time, export_time]))
-    plt.bar(tasks, times, orientation="horizontal", width = 0.3)
-    plt.clc()
-    plt.xlabel("Execution Time (s)")
-    plt.show()
+    runtimes = ra.get_runtimes()
+    print("Total Time", ra.full_run_time)
+    ra.graph()
