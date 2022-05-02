@@ -82,11 +82,15 @@ def save_row(row, fs_path: str):
     """
     fs, fs_base_path = fsspec.core.url_to_fs(fs_path)
     shard_index = row.img_shard
-    partition_group = row.partition_group
     embeddings = row.embeddings
+    if "partition_group" in row:
+        partition_group = row.partition_group
+        filename = f"img_emb_{shard_index}-{partition_group}.npy"
+    else:
+        filename = f"img_emb_{shard_index}.npy"
     np_embeddings = np.array(embeddings)
     fs.makedirs(fs_base_path, exist_ok=True)
-    save_path = os.path.join(fs_base_path, f"img_emb_{shard_index}-{partition_group}.npy")
+    save_path = os.path.join(fs_base_path, filename)
     # print(f"Saving: {save_path}")
     with fs.open(save_path, "wb") as f:
         np.save(f, np_embeddings)
@@ -127,7 +131,7 @@ def reorder_embeddings(
             pass
     
     # Some unexpected behavior can occur if we do not remove existing folders so we do that at the top
-    if working_fs.exists(output_folder_path) and not skip_sort:
+    if working_fs.exists(output_folder_path) and len(working_fs.ls(output_folder_path)) > 0 and not skip_sort:
         # Then we should delete it if we are overwriting or error if we aren't
         if overwrite:
             rm_folder(working_fs, output_folder_path)
@@ -138,7 +142,7 @@ def reorder_embeddings(
         working_fs.makedirs(output_folder_path, exist_ok=True)
 
 
-    if working_fs.exists(meta_embed_folder_path) and not skip_format_embed:
+    if working_fs.exists(meta_embed_folder_path) and len(working_fs.ls(meta_embed_folder_path)) > 0 and not skip_format_embed:
         # Then if we are not skipping embed, we need to check if we enabled overwrites
         if overwrite:
             rm_folder(working_fs, meta_embed_folder_path)
@@ -149,7 +153,7 @@ def reorder_embeddings(
         working_fs.makedirs(meta_embed_folder_path, exist_ok=True)
 
     # And we need the same for the empty path
-    if working_fs.exists(empty_embed_folder_path) and not skip_fill:
+    if working_fs.exists(empty_embed_folder_path) and len(working_fs.ls(empty_embed_folder_path)) > 0 and not skip_fill:
         # Then if we are not skipping empty, we need to check if we enabled overwrites
         if overwrite:
             rm_folder(working_fs, empty_embed_folder_path)
@@ -171,6 +175,9 @@ def reorder_embeddings(
         .config("spark.ui.showConsoleProgress", "true")
         .config("spark.executor.memory", f"{memory}g")
         .config("spark.driver.memory", f"{memory}g")
+        .config("spark.sql.shuffle.partitions", "1000000")
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+        .config("spark.kryoserializer.buffer", "1g")
         .getOrCreate()
     )  # TODO: Add in the ability to have nodes
     sc = spark.sparkContext
@@ -194,7 +201,7 @@ def reorder_embeddings(
     remote_path = os.path.join(output_base_path, intermediate_folder, "meta_embed", "*.parquet")
     print("Recalling data from worker paths:", remote_path)
     data = spark.read.parquet(remote_path)  # TODO: Verify this work with remote files. It doesn't. It needs to be able to connect to the s3 file system.
-    example_embedding = np.array(data.first().embeddings)
+    print(f"Data has {data.rdd.getNumPartitions()} partitions")
 
     end_recall_timer()
 
@@ -204,6 +211,7 @@ def reorder_embeddings(
         # If an image returned a error during webdataset creation, it will still take up an index, but will not be included in the embeddings
         # This means if we do not account for these missing indices, we will be off by one for all subsequent embeddings in the shard
         # In order to fix these, we insert an empty embedding into every location where one is missing
+        example_embedding = np.array(data.first().embeddings)
         data.createOrReplaceTempView("df")
         missing_values = spark.sql(
             """
@@ -249,13 +257,20 @@ def reorder_embeddings(
     end_export_timer = ra.start_timer("Sort & Export")
     if not skip_sort:
         print("========= Grouping and Saving =========")
+        print("Number of partitions", data.rdd.getNumPartitions())
+        # data = data.repartition("img_shard")
         data.createOrReplaceTempView("df")
         data = spark.sql("""
             SELECT *, FLOOR(img_index / 1000) as partition_group FROM df
         """)
+        data = data.repartition("img_shard", "partition_group")
+        print("Number of partitions", data.rdd.getNumPartitions())
         grouped = (
-            data.orderBy("img_index")
+            data
+            # .orderBy("img_index")
+            .sortWithinPartitions("img_index")
             .groupBy("img_shard", "partition_group")
+            # .groupBy("img_shard")
             .agg(F.collect_list("embeddings").alias("embeddings"))
         )
 
