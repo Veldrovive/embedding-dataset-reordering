@@ -101,7 +101,12 @@ def verify_reorder(embeddings_folder, metadata_folder, reordered_embeddings_fold
                 errors.append([shard, original_index, img_shard, img_index])
     return errors
 
+
 class RuntimeAnalyzer:
+    """
+    Used for tracking runtimes where multiple iterations are performed possibly in parallel
+    Can graph the runtimes
+    """
     def __init__(self):
         self.runtimes = OrderedDict()  # Dictionary of lists of runtimes
         self.running = False
@@ -109,15 +114,25 @@ class RuntimeAnalyzer:
         self.full_run_time = None
 
     def start(self):
+        """
+        Initializes the runtime analyzer. Must be called before any other method
+        """
         self.runtimes.clear()
         self.running = True
         self.run_start = time.perf_counter()
-        
+
     def end(self):
+        """
+        Ends the analysis. Should be called before summaries are generated
+        """
         self.running = False
         self.full_run_time = time.perf_counter() - self.run_start
 
     def add_runtime(self, key, start, end):
+        """
+        Adds a runtime to the list of runtimes
+        Should rarely be used instaed of start_timer
+        """
         if not self.running:
             raise RuntimeError("Tried to add {key} while analyzer is not running")
         if key not in self.runtimes:
@@ -125,26 +140,55 @@ class RuntimeAnalyzer:
         self.runtimes[key].append(end - start)
 
     def start_timer(self, key):
+        """
+        Starts a timer for a given key
+        Returns a method to stop the timer
+        """
         if not self.running:
             raise RuntimeError("Tried to time {key} while analyzer is not running")
         start_time = time.perf_counter()
         return lambda: self.add_runtime(key, start_time, time.perf_counter())
 
     def get_runtimes(self):
-      total_runtimes = OrderedDict()
-      for key, runtimes in self.runtimes.items():
-        total_runtimes[key] = sum(runtimes)
-      return total_runtimes
+        """
+        Returns a dict of all runtimes
+        """
+        total_runtimes = OrderedDict()
+        for key, runtimes in self.runtimes.items():
+            total_runtimes[key] = sum(runtimes)
+        return total_runtimes
+
+    def get_average_runtimes(self):
+        """
+        Returns a dict of average runtimes
+        """
+        total_runtimes = self.get_runtimes()
+        for key, total_runtime in total_runtimes.items():
+            total_runtimes[key] = total_runtime / len(self.runtimes[key])
+        return total_runtimes
 
     def get_runtime_fractions(self):
-      return { key: runtime / self.full_run_time for key, runtime in self.get_runtimes().items() }
+        """
+        Returns a dict of the proportion of the total runtime each key took up
+        """
+        return {key: runtime / self.full_run_time for key, runtime in self.get_runtimes().items()}
 
-    def graph(self):
-      total_runtimes = self.get_runtimes()
-      tasks = list(total_runtimes.keys())
-      times = list(total_runtimes.values())
-      plt.bar(tasks, times, orientation="horizontal", width = 0.3)
-      plt.clc()
-      plt.xlabel("Execution Time (s)")
-      plt.xlim(0, max(times))
-      plt.show()
+    def graph(self, average=False):
+        """
+        Graphs the runtimes in terminal
+        """
+        if average:
+            total_runtimes = self.get_average_runtimes()
+        else:
+            total_runtimes = self.get_runtimes()
+        tasks = list(total_runtimes.keys())
+        times = list(total_runtimes.values())
+        plt.bar(tasks, times, orientation="horizontal", width=0.3)
+        plt.clc()
+        if average:
+            plt.title("Average runtimes")
+        else:
+            plt.title("Runtimes")
+        plt.xlabel("Execution Time (s)")
+        plt.xlim(0, max(times))
+        plt.show()
