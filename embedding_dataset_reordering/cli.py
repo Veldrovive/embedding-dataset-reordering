@@ -69,11 +69,11 @@ def example_key(metadata_folder):
 
 
 @cli.command()
-@click.option("--csv_path", default="./example.csv", help="Path to csv file", type=click.STRING)
-@click.option("--output_folder", default="./test_data", help="Path to output folder", type=click.STRING)
-@click.option("--samples_per_shard", default=10e4, help="Number of samples per shard", type=click.INT)
-@click.option("--thread_count", default=64, help="Number of threads to use", type=click.INT)
-@click.option("--image_size", default=256, help="Size of images", type=click.INT)
+@click.option("--csv-path", default="./example.csv", help="Path to csv file", type=click.STRING)
+@click.option("--output-folder", default="./test_data", help="Path to output folder", type=click.STRING)
+@click.option("--samples-per_shard", default=10e4, help="Number of samples per shard", type=click.INT)
+@click.option("--thread-count", default=64, help="Number of threads to use", type=click.INT)
+@click.option("--image-size", default=256, help="Size of images", type=click.INT)
 def download_data(csv_path, output_folder, samples_per_shard, thread_count, image_size):
     """
     Runs img2dataset.download to download the images from the csv file
@@ -83,13 +83,13 @@ def download_data(csv_path, output_folder, samples_per_shard, thread_count, imag
 
 @cli.command()
 @click.option(
-    "--input_folder", default="./test_data", help="Folder containing the webdataset shards", type=click.STRING
+    "--input-folder", default="./test_data", help="Folder containing the webdataset shards", type=click.STRING
 )
 @click.option(
-    "--output_folder", default="./test_data_inference", help="Folder to save the inference results", type=click.STRING
+    "--output-folder", default="./test_data_inference", help="Folder to save the inference results", type=click.STRING
 )
-@click.option("--samples_per_shard", default=10e4, help="Number of samples per shard", type=click.INT)
-@click.option("--batch_size", default=256, help="Batch size", type=click.INT)
+@click.option("--samples-per-shard", default=10e4, help="Number of samples per shard", type=click.INT)
+@click.option("--batch-size", default=256, help="Batch size", type=click.INT)
 def clip_inference(input_folder, output_folder, samples_per_shard, batch_size):
     """
     Runs clip_retrieval.clip_inference
