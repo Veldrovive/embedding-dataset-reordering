@@ -15,6 +15,8 @@ def get_example_key(metadata_folder="./"):
     """
     from_each = 2
     example_parquets = os.listdir(metadata_folder)
+    # Filter for parquets
+    example_parquets = [name for name in example_parquets if ".parquet" in name]
     example_keys = {}
     for example_parquet in example_parquets:
         shard = int(example_parquet.split("_")[-1].split(".")[0])
@@ -22,7 +24,12 @@ def get_example_key(metadata_folder="./"):
         df = pd.read_parquet(os.path.join(metadata_folder, example_parquet))
         example_rows = df.sample(n=from_each)
         for _, row in example_rows.iterrows():
-            example_keys[shard].append(row.image_path)
+            if "image_path" in row:
+                example_keys[shard].append(row.image_path)
+            elif "key" in row:
+                example_keys[shard].append(row.key)
+            else:
+                raise Exception("No key or image_path in row. Maybe img2dataset changed its output? Raise an issue on the github repo.")
     print("Example Keys:")
     for shard, keys in example_keys.items():
         print(f"Shard {shard} has keys {keys}")
